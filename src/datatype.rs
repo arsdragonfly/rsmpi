@@ -982,7 +982,7 @@ where
 }
 
 /// Provides a mutable pointer to the starting address in memory.
-pub unsafe trait PointerMut {
+pub unsafe trait PointerMut: Pointer {
     /// A mutable pointer to the starting address in memory
     fn pointer_mut(&mut self) -> *mut c_void;
 }
@@ -1407,6 +1407,16 @@ where
     }
 }
 
+unsafe impl<'d, 'b, D, B: ?Sized> Pointer for MutView<'d, 'b, D, B>
+where
+    D: 'd + Datatype,
+    B: 'b + PointerMut,
+{
+    fn pointer(&self) -> *const c_void {
+        self.buffer.pointer()
+    }
+}
+
 unsafe impl<'d, 'b, D, B: ?Sized> PointerMut for MutView<'d, 'b, D, B>
 where
     D: 'd + Datatype,
@@ -1547,6 +1557,15 @@ where
     type Out = <B as AsDatatype>::Out;
     fn as_datatype(&self) -> Self::Out {
         self.buf.as_datatype()
+    }
+}
+
+unsafe impl<'b, B: ?Sized, C, D> Pointer for PartitionMut<'b, B, C, D>
+where
+    B: 'b + PointerMut,
+{
+    fn pointer(&self) -> *const c_void {
+        self.buf.pointer()
     }
 }
 
