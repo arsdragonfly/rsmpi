@@ -75,8 +75,9 @@ use crate::{ffi, ffi::MPI_Datatype, raw::traits::*, with_uninitialized};
 /// Datatype traits
 pub mod traits {
     pub use super::{
-        AsDatatype, Buffer, BufferMut, Collection, Datatype, Equivalence, Partitioned,
-        PartitionedBuffer, PartitionedBufferMut, Pointer, PointerMut, UncommittedDatatype,
+        AsDatatype, Buffer, BufferMut, Collection, Datatype, Equivalence, MpiBuf, MpiBufMut,
+        Partitioned, PartitionedBuffer, PartitionedBufferMut, Pointer, PointerMut,
+        UncommittedDatatype,
     };
 }
 
@@ -1022,6 +1023,135 @@ where
     fn pointer_mut(&mut self) -> *mut c_void {
         self.as_mut_ptr() as _
     }
+}
+
+// -- Owned async buffers --
+//
+// `MpiBuf` / `MpiBufMut` describe buffers whose ownership is transferred to MPI for the
+// duration of a non-blocking operation, modeled after tokio-uring's `IoBuf` / `IoBufMut`.
+// Unlike [`Pointer`] / [`PointerMut`] (which are borrowing traits driven by `&self` /
+// `&mut self`), these traits are designed to be implemented by buffers that the caller
+// hands off by value (e.g. `Vec<T>`, `Box<[T]>`, `Box<T>`, `Arc<[T]>` clones) and gets back
+// once the operation completes.
+//
+// Compared to tokio-uring's byte-typed `IoBuf`, these traits are typed in MPI's natural
+// unit: `count_init` / `count_total` are measured in elements of `Self::Item`, so the
+// element type can be carried straight into `MPI_Send` / `MPI_Recv` via
+// `<Self::Item as Equivalence>::equivalent_datatype()`.
+//
+// Slicing (`MpiSlice` / `MpiSliceMut` / `Subrange<B>`) and concrete impls
+// (`Vec<T>`, `Box<[T]>`, `Box<T>`) are intentionally deferred to follow-up steps; see the
+// async-refactor branch plan.
+
+/// A buffer whose ownership can be transferred to MPI for the lifetime of a non-blocking
+/// operation.
+///
+/// `MpiBuf` is the read-only, owned analogue of [`Pointer`]. The runtime takes the buffer
+/// by value at submission time, holds it (still owning it) until `MPI_Wait` (or an
+/// equivalent completion check) succeeds, and then returns it to the caller. Examples of
+/// types that will implement `MpiBuf` are `Vec<T>`, `Box<[T]>`, `Box<T>`, and other heap
+/// containers whose backing storage does not move when the container itself moves.
+///
+/// # Counts
+///
+/// `MpiBuf` distinguishes two element counts, both measured in units of [`Self::Item`]
+/// (not bytes):
+///
+/// - [`count_init`](Self::count_init): the number of initialized, MPI-readable elements
+///   currently in the buffer. This is what a send-side operation should pass as the
+///   `count` argument to `MPI_Send` / `MPI_Isend`.
+/// - [`count_total`](Self::count_total): the maximum number of elements the buffer's
+///   backing storage can hold (capacity, in `Vec` terms). This is what a recv-side
+///   operation should pass as the `count` argument to `MPI_Recv` / `MPI_Irecv` when used
+///   as the destination of [`MpiBufMut`].
+///
+/// Implementers must uphold `count_init() <= count_total()` and both must be
+/// non-negative and representable as [`Count`].
+///
+/// # Safety
+///
+/// Implementers must guarantee all of the following:
+///
+/// 1. **Stable address.** [`stable_ptr`](Self::stable_ptr) must return the same address
+///    across moves of `Self`, until `Self` is dropped or a `&mut self` method on `Self`
+///    explicitly reallocates the backing storage. This rules out implementations that
+///    store the data inline in `Self` (e.g. `[T; N]` or any small-buffer-optimized
+///    container).
+/// 2. **Validity for reads.** The first `count_init()` elements at `stable_ptr()` must be
+///    initialized values of `Self::Item` and remain valid for reads for as long as `self`
+///    is live and no `&mut self` method has been called.
+/// 3. **No aliasing through the trait.** While a runtime owns the buffer for the duration
+///    of an MPI operation, no other handle obtained through this trait may concurrently
+///    read or write the same elements. Callers (typically the async runtime) are
+///    responsible for not constructing such aliases.
+/// 4. **`'static` and `Unpin`.** The buffer must not borrow from a non-`'static` lifetime
+///    and must not be `!Unpin`, so it can be freely moved into the runtime's bookkeeping.
+///
+/// A `slice()` method that returns an owning subrange view (`MpiSlice<B>`) will be added
+/// alongside the `MpiSlice` / `MpiSliceMut` traits in a follow-up commit.
+pub unsafe trait MpiBuf: Unpin + 'static {
+    /// The element type stored in the buffer. Carries the MPI datatype via
+    /// [`Equivalence::equivalent_datatype`].
+    type Item: Equivalence;
+
+    /// Returns a pointer to the first element of the buffer.
+    ///
+    /// The returned pointer must satisfy the stability and validity contracts described
+    /// in the trait-level safety section.
+    fn stable_ptr(&self) -> *const Self::Item;
+
+    /// Returns the number of initialized elements currently in the buffer.
+    ///
+    /// This is the value a sender should pass as MPI's `count` argument.
+    fn count_init(&self) -> Count;
+
+    /// Returns the total element capacity of the buffer's backing storage.
+    ///
+    /// This is the value a receiver should pass as MPI's `count` argument to bound the
+    /// maximum number of elements MPI may write.
+    fn count_total(&self) -> Count;
+
+    /// Returns `true` if the buffer currently has no initialized elements.
+    fn is_empty(&self) -> bool {
+        self.count_init() == 0
+    }
+}
+
+/// A mutable owned buffer that MPI can write into.
+///
+/// `MpiBufMut` extends [`MpiBuf`] with the ability to obtain a mutable pointer to the
+/// backing storage and to update the initialized-element count after an MPI receive
+/// reports how many elements it actually wrote.
+///
+/// # Safety
+///
+/// In addition to the guarantees required by [`MpiBuf`], implementers must guarantee:
+///
+/// 1. **Validity for writes.** The first `count_total()` elements at
+///    [`stable_mut_ptr`](Self::stable_mut_ptr) must be valid for writes (i.e. the backing
+///    allocation has at least `count_total()` element slots, even if only `count_init()`
+///    are currently initialized).
+/// 2. **No aliasing through the trait.** Same as [`MpiBuf`], but for writes as well as
+///    reads.
+pub unsafe trait MpiBufMut: MpiBuf {
+    /// Returns a mutable pointer to the first element of the buffer.
+    ///
+    /// The returned pointer must be valid for writes to the first `count_total()`
+    /// elements, in addition to all guarantees inherited from [`MpiBuf::stable_ptr`].
+    fn stable_mut_ptr(&mut self) -> *mut Self::Item;
+
+    /// Updates the initialized-element count after MPI has written into the buffer.
+    ///
+    /// Typically called by the async runtime after `MPI_Wait` returns, using the count
+    /// reported by `MPI_Get_count` on the resulting `MPI_Status`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that:
+    /// - `count` is in `0..=self.count_total()`.
+    /// - The first `count` elements at `self.stable_mut_ptr()` are actually initialized
+    ///   values of `Self::Item` (i.e. MPI really did write that many elements).
+    unsafe fn set_init(&mut self, count: Count);
 }
 
 /// A buffer is a region in memory that starts at `pointer()` and contains `count()` copies of
