@@ -1045,9 +1045,10 @@ where
 ///
 /// # Counts
 ///
-/// `count_init()` is the send count; `count_total()` is the receive bound. Both are
-/// element counts, must satisfy `0 <= count_init() <= count_total()`, and must fit in
-/// [`Count`].
+/// `count_init()` is the initialized/readable prefix; `count_total()` is the available
+/// storage. Both are element counts, must satisfy `0 <= count_init() <= count_total()`,
+/// and must fit in [`Count`]. MPI operation result counts belong to the operation
+/// status/result, not to the buffer.
 ///
 /// # Safety
 ///
@@ -1079,10 +1080,10 @@ pub unsafe trait MpiBuf: Unpin + 'static {
     /// Pointer to the first element of the buffer.
     fn stable_ptr(&self) -> *const Self::Item;
 
-    /// Number of initialized elements currently in the buffer.
+    /// Number of initialized/readable elements currently in the buffer.
     fn count_init(&self) -> Count;
 
-    /// Total element capacity of the buffer's backing storage.
+    /// Total element storage available to MPI.
     fn count_total(&self) -> Count;
 }
 
@@ -1098,14 +1099,17 @@ pub unsafe trait MpiBufMut: MpiBuf {
     /// Mutable pointer to the first element of the buffer.
     fn stable_mut_ptr(&mut self) -> *mut Self::Item;
 
-    /// Updates the initialized-element count after an MPI receive completes.
+    /// Marks a prefix of the buffer as initialized after raw writes into storage.
+    ///
+    /// This is Rust memory-initialization bookkeeping only. It does not encode how many
+    /// elements an MPI message contained.
     ///
     /// # Safety
     ///
     /// The caller must guarantee that:
     /// - `count` is in `0..=self.count_total()`.
-    /// - The first `count` elements at `self.stable_mut_ptr()` are actually initialized
-    ///   values of `Self::Item` (i.e. MPI really did write that many elements).
+    /// - The first `count` elements at `self.stable_mut_ptr()` are initialized values of
+    ///   `Self::Item`.
     unsafe fn set_init(&mut self, count: Count);
 }
 
@@ -1239,7 +1243,7 @@ where
     /// Mutable pointer to the first element of the slice's view.
     fn stable_slice_mut_ptr(&mut self) -> *mut <Self::Buf as MpiBuf>::Item;
 
-    /// Updates the initialized-element count after an MPI receive completes.
+    /// Marks a prefix of the slice as initialized after raw writes into storage.
     ///
     /// For [`Subrange`], this preserves the underlying buffer's high-water mark:
     /// `B::set_init(max(B::count_init(), self.begin() + count))`.
@@ -1247,7 +1251,7 @@ where
     /// # Safety
     ///
     /// - `count` must be in `0..=self.slice_count_total()`.
-    /// - The first `count` elements at `self.stable_slice_mut_ptr()` must be initialized
+    /// - The first `count` elements at `self.stable_slice_mut_ptr()` are initialized
     ///   values of `<Self::Buf as MpiBuf>::Item`.
     /// - For a [`Subrange<B>`], the first `self.begin()` elements of the underlying `B`
     ///   were already initialized.
