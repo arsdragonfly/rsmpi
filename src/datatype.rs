@@ -65,7 +65,14 @@
 //! - **4.3**: Canonical pack and unpack, `MPI_Pack_external()`, `MPI_Unpack_external()`,
 //! `MPI_Pack_external_size()`
 
-use std::{borrow::Borrow, marker::PhantomData, mem, os::raw::c_void, slice};
+use std::{
+    borrow::Borrow,
+    marker::PhantomData,
+    mem,
+    ops::{Bound, Range, RangeBounds, RangeFull},
+    os::raw::c_void,
+    slice,
+};
 
 use conv::ConvUtil;
 
@@ -76,8 +83,8 @@ use crate::{ffi, ffi::MPI_Datatype, raw::traits::*, with_uninitialized};
 pub mod traits {
     pub use super::{
         AsDatatype, Buffer, BufferMut, Collection, Datatype, Equivalence, MpiBuf, MpiBufMut,
-        Partitioned, PartitionedBuffer, PartitionedBufferMut, Pointer, PointerMut,
-        UncommittedDatatype,
+        MpiSlice, MpiSliceMut, Partitioned, PartitionedBuffer, PartitionedBufferMut, Pointer,
+        PointerMut, UncommittedDatatype,
     };
 }
 
@@ -1027,46 +1034,20 @@ where
 
 // -- Owned async buffers --
 //
-// `MpiBuf` / `MpiBufMut` describe buffers whose ownership is transferred to MPI for the
-// duration of a non-blocking operation, modeled after tokio-uring's `IoBuf` / `IoBufMut`.
-// Unlike [`Pointer`] / [`PointerMut`] (which are borrowing traits driven by `&self` /
-// `&mut self`), these traits are designed to be implemented by buffers that the caller
-// hands off by value (e.g. `Vec<T>`, `Box<[T]>`, `Box<T>`, `Arc<[T]>` clones) and gets back
-// once the operation completes.
-//
-// Compared to tokio-uring's byte-typed `IoBuf`, these traits are typed in MPI's natural
-// unit: `count_init` / `count_total` are measured in elements of `Self::Item`, so the
-// element type can be carried straight into `MPI_Send` / `MPI_Recv` via
-// `<Self::Item as Equivalence>::equivalent_datatype()`.
-//
-// Slicing (`MpiSlice` / `MpiSliceMut` / `Subrange<B>`) and concrete impls
-// (`Vec<T>`, `Box<[T]>`, `Box<T>`) are intentionally deferred to follow-up steps; see the
-// async-refactor branch plan.
+// Counts are measured in elements of `Self::Item`, not bytes, so the element type carries
+// the MPI datatype via `<Self::Item as Equivalence>::equivalent_datatype()`.
 
-/// A buffer whose ownership can be transferred to MPI for the lifetime of a non-blocking
-/// operation.
+/// Read-only buffer passed by value to non-blocking MPI operations.
 ///
-/// `MpiBuf` is the read-only, owned analogue of [`Pointer`]. The runtime takes the buffer
-/// by value at submission time, holds it (still owning it) until `MPI_Wait` (or an
-/// equivalent completion check) succeeds, and then returns it to the caller. Examples of
-/// types that will implement `MpiBuf` are `Vec<T>`, `Box<[T]>`, `Box<T>`, and other heap
-/// containers whose backing storage does not move when the container itself moves.
+/// Tokio-uring analogue: `tokio_uring::buf::IoBuf`.
+///
+/// Owned counterpart to borrowing [`Pointer`].
 ///
 /// # Counts
 ///
-/// `MpiBuf` distinguishes two element counts, both measured in units of [`Self::Item`]
-/// (not bytes):
-///
-/// - [`count_init`](Self::count_init): the number of initialized, MPI-readable elements
-///   currently in the buffer. This is what a send-side operation should pass as the
-///   `count` argument to `MPI_Send` / `MPI_Isend`.
-/// - [`count_total`](Self::count_total): the maximum number of elements the buffer's
-///   backing storage can hold (capacity, in `Vec` terms). This is what a recv-side
-///   operation should pass as the `count` argument to `MPI_Recv` / `MPI_Irecv` when used
-///   as the destination of [`MpiBufMut`].
-///
-/// Implementers must uphold `count_init() <= count_total()` and both must be
-/// non-negative and representable as [`Count`].
+/// `count_init()` is the send count; `count_total()` is the receive bound. Both are
+/// element counts, must satisfy `0 <= count_init() <= count_total()`, and must fit in
+/// [`Count`].
 ///
 /// # Safety
 ///
@@ -1080,70 +1061,44 @@ where
 /// 2. **Validity for reads.** The first `count_init()` elements at `stable_ptr()` must be
 ///    initialized values of `Self::Item` and remain valid for reads for as long as `self`
 ///    is live and no `&mut self` method has been called.
-/// 3. **No aliasing through the trait.** While a runtime owns the buffer for the duration
+/// 3. **Backing storage through `count_total`.** `stable_ptr()` must be derived from
+///    backing storage for `count_total()` element slots and be valid for pointer
+///    arithmetic through those slots (including the one-past-the-end address), even
+///    though only the first `count_init()` elements are readable.
+/// 4. **No aliasing through the trait.** While a runtime owns the buffer for the duration
 ///    of an MPI operation, no other handle obtained through this trait may concurrently
 ///    read or write the same elements. Callers (typically the async runtime) are
 ///    responsible for not constructing such aliases.
-/// 4. **`'static` and `Unpin`.** The buffer must not borrow from a non-`'static` lifetime
+/// 5. **`'static` and `Unpin`.** The buffer must not borrow from a non-`'static` lifetime
 ///    and must not be `!Unpin`, so it can be freely moved into the runtime's bookkeeping.
-///
-/// A `slice()` method that returns an owning subrange view (`MpiSlice<B>`) will be added
-/// alongside the `MpiSlice` / `MpiSliceMut` traits in a follow-up commit.
 pub unsafe trait MpiBuf: Unpin + 'static {
     /// The element type stored in the buffer. Carries the MPI datatype via
     /// [`Equivalence::equivalent_datatype`].
     type Item: Equivalence;
 
-    /// Returns a pointer to the first element of the buffer.
-    ///
-    /// The returned pointer must satisfy the stability and validity contracts described
-    /// in the trait-level safety section.
+    /// Pointer to the first element of the buffer.
     fn stable_ptr(&self) -> *const Self::Item;
 
-    /// Returns the number of initialized elements currently in the buffer.
-    ///
-    /// This is the value a sender should pass as MPI's `count` argument.
+    /// Number of initialized elements currently in the buffer.
     fn count_init(&self) -> Count;
 
-    /// Returns the total element capacity of the buffer's backing storage.
-    ///
-    /// This is the value a receiver should pass as MPI's `count` argument to bound the
-    /// maximum number of elements MPI may write.
+    /// Total element capacity of the buffer's backing storage.
     fn count_total(&self) -> Count;
-
-    /// Returns `true` if the buffer currently has no initialized elements.
-    fn is_empty(&self) -> bool {
-        self.count_init() == 0
-    }
 }
 
-/// A mutable owned buffer that MPI can write into.
+/// Mutable owned buffer that MPI can write into.
 ///
-/// `MpiBufMut` extends [`MpiBuf`] with the ability to obtain a mutable pointer to the
-/// backing storage and to update the initialized-element count after an MPI receive
-/// reports how many elements it actually wrote.
+/// Tokio-uring analogue: `tokio_uring::buf::IoBufMut`.
 ///
 /// # Safety
 ///
-/// In addition to the guarantees required by [`MpiBuf`], implementers must guarantee:
-///
-/// 1. **Validity for writes.** The first `count_total()` elements at
-///    [`stable_mut_ptr`](Self::stable_mut_ptr) must be valid for writes (i.e. the backing
-///    allocation has at least `count_total()` element slots, even if only `count_init()`
-///    are currently initialized).
-/// 2. **No aliasing through the trait.** Same as [`MpiBuf`], but for writes as well as
-///    reads.
+/// In addition to [`MpiBuf`]'s guarantees, the first `count_total()` elements at
+/// [`stable_mut_ptr`](Self::stable_mut_ptr) must be valid for writes.
 pub unsafe trait MpiBufMut: MpiBuf {
-    /// Returns a mutable pointer to the first element of the buffer.
-    ///
-    /// The returned pointer must be valid for writes to the first `count_total()`
-    /// elements, in addition to all guarantees inherited from [`MpiBuf::stable_ptr`].
+    /// Mutable pointer to the first element of the buffer.
     fn stable_mut_ptr(&mut self) -> *mut Self::Item;
 
-    /// Updates the initialized-element count after MPI has written into the buffer.
-    ///
-    /// Typically called by the async runtime after `MPI_Wait` returns, using the count
-    /// reported by `MPI_Get_count` on the resulting `MPI_Status`.
+    /// Updates the initialized-element count after an MPI receive completes.
     ///
     /// # Safety
     ///
@@ -1152,6 +1107,292 @@ pub unsafe trait MpiBufMut: MpiBuf {
     /// - The first `count` elements at `self.stable_mut_ptr()` are actually initialized
     ///   values of `Self::Item` (i.e. MPI really did write that many elements).
     unsafe fn set_init(&mut self, count: Count);
+}
+
+/// Owned subrange view into an [`MpiBuf`].
+///
+/// Tokio-uring analogue: `tokio_uring::buf::Slice<T>`.
+///
+/// Stores an owned buffer plus `begin` and `end`, both measured in elements of `B::Item`.
+/// It implements [`MpiSlice`] but intentionally not [`MpiBuf`], so nested slicing flattens
+/// into the same `B` rather than producing `Subrange<Subrange<B>>`.
+pub struct Subrange<B> {
+    buf: B,
+    begin: Count,
+    end: Count,
+}
+
+impl<B> Subrange<B> {
+    fn new(buf: B, begin: Count, end: Count) -> Self {
+        Self { buf, begin, end }
+    }
+
+    /// Offset in elements of `B::Item`.
+    pub fn begin(&self) -> Count {
+        self.begin
+    }
+
+    /// Offset one past the last element in the slice.
+    pub fn end(&self) -> Count {
+        self.end
+    }
+
+    /// Borrows the underlying buffer.
+    pub fn get_ref(&self) -> &B {
+        &self.buf
+    }
+
+    /// Returns the underlying buffer.
+    pub fn into_inner(self) -> B {
+        self.buf
+    }
+}
+
+// Extracted form of tokio-uring's inline `BoundedBuf::slice` range resolution.
+#[inline]
+fn resolve_subrange<R: RangeBounds<Count>>(base: Count, len: Count, range: R) -> (Count, Count) {
+    debug_assert!(base >= 0);
+    debug_assert!(len >= 0);
+
+    let begin = match range.start_bound() {
+        Bound::Included(&n) => n,
+        Bound::Excluded(&n) => n.checked_add(1).expect("slice begin overflow"),
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(&n) => n.checked_add(1).expect("slice end overflow"),
+        Bound::Excluded(&n) => n,
+        Bound::Unbounded => len,
+    };
+
+    assert!(begin >= 0, "slice begin must be non-negative (got {begin})");
+    assert!(end >= begin, "slice end ({end}) must be >= begin ({begin})");
+    assert!(end <= len, "slice end ({end}) exceeds slice length ({len})");
+
+    let begin = base.checked_add(begin).expect("slice begin overflow");
+    let end = base.checked_add(end).expect("slice end overflow");
+    (begin, end)
+}
+
+/// Owned MPI buffer view, either a whole [`MpiBuf`] or a [`Subrange`].
+///
+/// Tokio-uring analogue: `tokio_uring::buf::BoundedBuf`.
+///
+/// This is the FFI-site bound for owned MPI operations. Slice accessors are named
+/// separately from [`MpiBuf`] / [`MpiBufMut`] accessors so whole-buffer impls do not make
+/// calls like `buf.count_init()` ambiguous when both traits are in scope.
+///
+/// # Safety
+///
+/// Same as [`MpiBuf`], but scoped to the slice view.
+pub unsafe trait MpiSlice: Unpin + 'static {
+    /// Underlying owned buffer type.
+    type Buf: MpiBuf;
+    /// Bounds type used to reconstruct this view from its underlying buffer.
+    type Bounds: RangeBounds<Count>;
+
+    /// Pointer to the first element of the slice's view.
+    fn stable_slice_ptr(&self) -> *const <Self::Buf as MpiBuf>::Item;
+
+    /// Number of initialized elements within the slice's view.
+    fn slice_count_init(&self) -> Count;
+
+    /// Number of element slots within the slice's view.
+    fn slice_count_total(&self) -> Count;
+
+    /// Borrows the underlying buffer.
+    fn get_buf(&self) -> &Self::Buf;
+
+    /// Returns this view's bounds in the underlying buffer.
+    fn bounds(&self) -> Self::Bounds;
+
+    /// Reconstructs this view from its underlying buffer and bounds.
+    fn from_buf_bounds(buf: Self::Buf, bounds: Self::Bounds) -> Self
+    where
+        Self: Sized;
+
+    /// Take an owning subrange view, flattening nested subranges.
+    fn slice<R: RangeBounds<Count>>(self, range: R) -> Subrange<Self::Buf>
+    where
+        Self: Sized;
+
+    /// Equivalent to `self.slice(..)`.
+    fn slice_full(self) -> Subrange<Self::Buf>
+    where
+        Self: Sized,
+    {
+        self.slice(..)
+    }
+}
+
+/// Mutable owned MPI buffer view.
+///
+/// Tokio-uring analogue: `tokio_uring::buf::BoundedBufMut`.
+///
+/// # Safety
+///
+/// Same as [`MpiBufMut`], but scoped to the slice view.
+pub unsafe trait MpiSliceMut: MpiSlice
+where
+    Self::Buf: MpiBufMut,
+{
+    /// Mutable pointer to the first element of the slice's view.
+    fn stable_slice_mut_ptr(&mut self) -> *mut <Self::Buf as MpiBuf>::Item;
+
+    /// Updates the initialized-element count after an MPI receive completes.
+    ///
+    /// For [`Subrange`], this preserves the underlying buffer's high-water mark:
+    /// `B::set_init(max(B::count_init(), self.begin() + count))`.
+    ///
+    /// # Safety
+    ///
+    /// - `count` must be in `0..=self.slice_count_total()`.
+    /// - The first `count` elements at `self.stable_slice_mut_ptr()` must be initialized
+    ///   values of `<Self::Buf as MpiBuf>::Item`.
+    /// - For a [`Subrange<B>`], the first `self.begin()` elements of the underlying `B`
+    ///   were already initialized.
+    unsafe fn set_slice_init(&mut self, count: Count);
+}
+
+unsafe impl<B: MpiBuf> MpiSlice for B {
+    type Buf = B;
+    type Bounds = RangeFull;
+
+    fn stable_slice_ptr(&self) -> *const B::Item {
+        MpiBuf::stable_ptr(self)
+    }
+
+    fn slice_count_init(&self) -> Count {
+        MpiBuf::count_init(self)
+    }
+
+    fn slice_count_total(&self) -> Count {
+        MpiBuf::count_total(self)
+    }
+
+    fn get_buf(&self) -> &B {
+        self
+    }
+
+    fn bounds(&self) -> RangeFull {
+        ..
+    }
+
+    fn from_buf_bounds(buf: B, _: RangeFull) -> B {
+        buf
+    }
+
+    fn slice<R: RangeBounds<Count>>(self, range: R) -> Subrange<B> {
+        let total = MpiBuf::count_total(&self);
+        let (begin, end) = resolve_subrange(0, total, range);
+        assert!(
+            begin <= MpiBuf::count_init(&self),
+            "slice begin ({begin}) exceeds initialized count ({init})",
+            init = MpiBuf::count_init(&self)
+        );
+        Subrange::new(self, begin, end)
+    }
+}
+
+unsafe impl<B: MpiBufMut> MpiSliceMut for B {
+    fn stable_slice_mut_ptr(&mut self) -> *mut B::Item {
+        MpiBufMut::stable_mut_ptr(self)
+    }
+
+    unsafe fn set_slice_init(&mut self, count: Count) {
+        // SAFETY: forwarded directly; caller upholds `MpiBufMut::set_init`'s contract.
+        unsafe { MpiBufMut::set_init(self, count) }
+    }
+}
+
+unsafe impl<B: MpiBuf> MpiSlice for Subrange<B> {
+    type Buf = B;
+    type Bounds = Range<Count>;
+
+    fn stable_slice_ptr(&self) -> *const B::Item {
+        // SAFETY: `begin` was range-checked at construction.
+        let begin = usize::try_from(self.begin).expect("slice begin must be non-negative");
+        unsafe { MpiBuf::stable_ptr(&self.buf).add(begin) }
+    }
+
+    fn slice_count_init(&self) -> Count {
+        // Clamp the underlying buffer's init high-water mark to the slice's window.
+        let buf_init = MpiBuf::count_init(&self.buf);
+        if buf_init <= self.begin {
+            0
+        } else {
+            core::cmp::min(self.end, buf_init) - self.begin
+        }
+    }
+
+    fn slice_count_total(&self) -> Count {
+        self.end - self.begin
+    }
+
+    fn get_buf(&self) -> &B {
+        &self.buf
+    }
+
+    fn bounds(&self) -> Range<Count> {
+        self.begin..self.end
+    }
+
+    fn from_buf_bounds(buf: B, bounds: Range<Count>) -> Self {
+        assert!(
+            bounds.start >= 0,
+            "slice begin must be non-negative (got {begin})",
+            begin = bounds.start
+        );
+        assert!(
+            bounds.end >= bounds.start,
+            "slice end ({end}) must be >= begin ({begin})",
+            begin = bounds.start,
+            end = bounds.end
+        );
+        assert!(
+            bounds.end <= MpiBuf::count_total(&buf),
+            "slice end ({end}) exceeds buffer count_total ({total})",
+            end = bounds.end,
+            total = MpiBuf::count_total(&buf)
+        );
+        assert!(
+            bounds.start <= MpiBuf::count_init(&buf),
+            "slice begin ({begin}) exceeds initialized count ({init})",
+            begin = bounds.start,
+            init = MpiBuf::count_init(&buf)
+        );
+        Subrange::new(buf, bounds.start, bounds.end)
+    }
+
+    fn slice<R: RangeBounds<Count>>(self, range: R) -> Subrange<B> {
+        let (begin, end) = resolve_subrange(self.begin, self.end - self.begin, range);
+        assert!(
+            begin <= MpiBuf::count_init(&self.buf),
+            "slice begin ({begin}) exceeds initialized count ({init})",
+            init = MpiBuf::count_init(&self.buf)
+        );
+        Subrange::new(self.buf, begin, end)
+    }
+}
+
+unsafe impl<B: MpiBufMut> MpiSliceMut for Subrange<B> {
+    fn stable_slice_mut_ptr(&mut self) -> *mut B::Item {
+        // SAFETY: `begin` was range-checked at construction.
+        let begin = usize::try_from(self.begin).expect("slice begin must be non-negative");
+        unsafe { MpiBufMut::stable_mut_ptr(&mut self.buf).add(begin) }
+    }
+
+    unsafe fn set_slice_init(&mut self, count: Count) {
+        debug_assert!(count >= 0);
+        debug_assert!(count <= self.end - self.begin);
+        // SAFETY: The trait contract covers the prefix implied by `self.begin`.
+        let init = self
+            .begin
+            .checked_add(count)
+            .expect("slice initialized count overflow");
+        let init = core::cmp::max(MpiBuf::count_init(&self.buf), init);
+        unsafe { MpiBufMut::set_init(&mut self.buf, init) }
+    }
 }
 
 /// A buffer is a region in memory that starts at `pointer()` and contains `count()` copies of
